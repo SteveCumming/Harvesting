@@ -1,0 +1,289 @@
+---
+title: "Harvesting and all that"
+author: "Steve Cumming"
+date: "March 23, 2016"
+output: html_document
+---
+
+This week's lab combines a number of items of unfinished business all related to the subject of the week:"Simulé l'expoitation forestière". We explores some details of implementing AAC calculations on real landscapes. We consider initially unmanaged landscapes that are subject to natural disturbances. The landscape age structure will of course different from a regulated forest. The four basic components we will cover are:
+
+1. Volume-Age Tables;
+2. Dynamic AAC Calculations;
+3. Simple Harvest Scheduling;
+4. Links to a soil carbon Model. 
+
+These build up in sequence as follows: 1:2:3 and 1:4. In the end, we will attempt to combine them all into an integrated model of forest growth, fire, harvesting and carbon stocks.
+
+## Volume-Age Tables
+
+Volume age tables (or Yield Tables) specify the merchantable volume of wood fibre obtainable per ha of forest land as a function of estimated age, regarded as either time since last stand-initiating fire, or mean age of the dominant cohort.
+
+Yield tables may be represented as tables grouped by 10 or 20 year age class, by coefficients of fitted models which predict volume as a function of age, and possibly other characteristics such as site index. Usually, tables multiple colummns representing two or more tree species that may be present in the stand. Further, there may be many tables representing different _strata_ defined by ecotype, site, dominant tree species, ecoregion, or many other factors, as discussed in class (see course notes).
+
+Most Provinces (e.g. Newfoundland, Quebec, Ontario) have their own famlies of Tables, that differ in important respects. Alberta has none officially, so every FMA holder uses their own. The situation is complex, and there is no general solution. For models running over any large area, there is a data assimilation problem to solve to provide spatially varying Volume Age tables that may be acceptable to stake-holders. The Tardis simulation model and CASFRI standard provide some of the basic tools needed for systematic data assimilation. 
+
+In this excercise, we will some tables provided in 2001 by Alberta Pacific Forest Industries Ltd. to support various landscape excercises they were backing at the time. The table consists of 7 strata, each with a deciduous and a coniferous component. The Volumes are reported in 10yr age classes.
+
+To illustrate some features of a general Volume Age table/data assimilation procedure we will read this table, reorganise it, choose one strata more or less at random (because who knows what they mean anymore?) and convert it into a numeric vector of 1 yr steps, from 0 to __yieldTableMaxAge__. We will start by defining a module, which let's call it __yieldTables___.
+
+
+
+```{r test_yieldTables}
+library(SpaDES)
+library(magrittr)
+
+#inputDir <- file.path(tempdir(), "inputs") %>% checkPath(create = TRUE)
+baseDir<-"/Users/stevec/Dropbox/SpaDES/Data"
+outputDir <- file.path(tempdir(), "outputs")  %>% checkPath(create = TRUE)
+times <- list(start = 0, end = 10)
+parameters <- list(
+  .globals = list(burnStats = "nPixelsBurned"),
+  #.progress = list(type = "text", interval = 1), # for a progress bar
+  ## If there are further modules, each can have its own set of parameters:
+  yieldTables = list(
+    yieldTableDir = "volumeAgeTables"
+    )
+  #module2 = list(param1 = value1, param2 = value2)
+)
+modules <- list("loadYieldTables")
+objects <- list()
+paths <- list(
+  cachePath = file.path(outputDir, "cache"),
+  modulePath = file.path(".","Harvesting"),
+  inputPath = baseDir,
+  outputPath = outputDir
+)
+
+mySim <- simInit(times = times, params = parameters, 
+                 modules = modules,
+                 objects = objects, paths = paths)
+spades(mySim)
+plot(mySim$yieldTables$AB,xlab="Stand Age", ylab="Volume (m^3/ha)")
+```
+
+
+# One time AAC Calculations
+
+
+In this section, we implement a simple AAC caculator based on Hanzlik's (1922) formula.
+
+The can be calculated given a yield curve and an age structure as follows.
+
+$$ V_m/R + I $$
+
+where R is the rotation age which can be estimated from the age that maximises mean annual increment.
+
+$$R = \underset{t}{\arg\max}\;V(t)/t$$
+
+Then $V_m$ is the volume of mature timber, older than R, while I in the increment due to younger forest.
+
+In this code, we allow the Maximum age since disturbance, and the maximum yieldcurve age to differ. The default values are 200 and 300yr respectively. There are probably edge cases we have not tested.  
+
+
+```{r test_Hanzik}
+library(SpaDES)
+library(magrittr)
+library(raster)
+inputDir <- file.path("inputs") %>% checkPath(create = TRUE)
+outputDir <- file.path("outputs")
+times <- list(start = 0, end = 10)
+parameters <- list(
+  Hanzlik = list(replanInterval = 10,
+                 rationPeriodMultiplier = 2)
+)
+modules <- list("loadYieldTables", "Hanzlik")
+
+ageMap <- raster(raster::extent(0,49,0,49),nrow=50, ncol=50, vals=as.integer(runif(50*50)*150))
+objects <- list(ageMap=ageMap,
+                #strataMap=raster(raster::extent(0,49,0,49),nrow=50, ncol=50, vals=rep(5,50*50)),
+                strataMap=randomPolygons(ageMap,numTypes=8),
+                landscapeAttr=list(cellSize=6.25)
+                )
+            
+paths <- list(
+  cachePath = file.path(outputDir, "cache"),
+  modulePath = file.path("scfmModules"),
+  inputPath = inputDir,
+  outputPath = outputDir
+)
+
+mySim <- simInit(times = times, params = parameters, modules = modules,
+                 objects = objects, paths = paths)
+
+if (exists("mySim")){
+  tmp <-spades(mySim)
+}
+
+```
+
+#Test Basic Harvesting Module
+
+
+Finally, we can add a harvesting module
+
+It's conventional to impose some limits on what cells can be harvested. A minimum volume requirement is one way of doing that, and this can be converted to an age by consulting the yield tables.
+
+After that, there's several sequencing options to consider
+
+1. Random
+2. Sequential
+3. Oldest First
+4. Highest Volume first
+
+This version executes only an oldest-first policy
+
+```{r test_Harvest}
+library(SpaDES)
+library(magrittr)
+library(raster)
+try(rm(mySim))
+inputDir <- file.path("inputs") %>% checkPath(create = TRUE)
+outputDir <- file.path("outputs")
+times <- list(start = 0, end = 10)
+parameters <- list(
+  Hanzlik = list(replanInterval = 10,
+                 rationPeriodMultiplier = 2)
+)
+modules <- list("loadYieldTables", "Hanzlik", "harvest", "ageModule")
+
+objects <- list(
+  ageMap=raster(raster::extent(0,49,0,49),nrow=50, ncol=50, vals=as.integer(runif(50*50)*150)),
+  strataMap=randomPolygons(ageMap,numTypes=8),
+  landscapeAttr=list(cellSize=6.25)
+)
+            
+paths <- list(
+  cachePath = file.path(outputDir, "cache"),
+  modulePath = file.path("scfmModules"),
+  inputPath = inputDir,
+  outputPath = outputDir
+)
+
+mySim <- simInit(times = times, params = parameters, modules = modules,
+                 objects = objects, paths = paths)
+
+if (exists("mySim")){
+  tmp <-spades(mySim)
+}
+
+```
+
+# Natural Disturbance Regime
+
+Now we add a disturbance module to this preceding code, based on the Van Wagner (1978) random, age-independent burning probability. We allow the forest to age for 200 years to reach something an equilibrium, than calculate AAC every 10 years thereafter.
+
+
+It's entertaining to watch the interaction of disturbance, ageing, and a declining yield curve.
+
+
+
+##Test Basic Harvesting Module with fire
+
+```{r test_Harvest+Fire}
+library(SpaDES)
+library(magrittr)
+library(raster)
+try(rm(mySim))
+inputDir <- file.path("inputs") %>% checkPath(create = TRUE)
+outputDir <- file.path("outputs")
+times <- list(start = 0, end = 50)
+parameters <- list(
+  Hanzlik = list(replanInterval = 10,
+                 rationPeriodMultiplier = 2)
+)
+modules <- list("loadYieldTables", "Hanzlik", "harvest", "ageModule", "scfmIgnition", "scfmEscape", "scfmSpread","mapBurns")
+
+ageMap<-raster(raster::extent(0,49,0,49),nrow=50, ncol=50, vals=as.integer(runif(50*50)*150))
+flammableMap <- ageMap * 0
+objects <- list(
+                scfmPars=list(pSpread=0.235,
+                  p0=0.115,
+                  naiveP0=0.15, 
+                  pIgnition=0.001, #0.0000112,
+                  maxBurnCells=NA
+                  ),
+                ageMap = ageMap,
+                strataMap=randomPolygons(ageMap,numTypes=8),
+                landscapeAttr=list(cellSize=6.25),
+                flammableMap=flammableMap
+            )
+            
+paths <- list(
+  cachePath = file.path(outputDir, "cache"),
+  modulePath = file.path("scfmModules"),
+  inputPath = inputDir,
+  outputPath = outputDir
+)
+
+mySim <- simInit(times = times, params = parameters, modules = modules,
+                 objects = objects, paths = paths)
+
+if (exists("mySim")){
+  tmp <-spades(mySim)
+}
+
+```
+
+#Add disturbanceMap and variable persistence Times
+
+```{r ReadyForYou}
+library(SpaDES)
+library(magrittr)
+library(raster)
+try(rm(mySim))
+dev.useRSGD(FALSE)
+try(dev.off(),silent=TRUE)
+inputDir <- file.path("inputs") %>% checkPath(create = TRUE)
+outputDir <- file.path("outputs")
+times <- list(start = 0, end = 50)
+parameters <- list(
+  Hanzlik = list(replanInterval = 10,
+                 rationPeriodMultiplier = 2),
+  stateVars = list(persistTimes=c(20,10,10))
+)
+modules <- list("loadYieldTables", "Hanzlik", "harvest", "ageModule", "scfmIgnition", "scfmEscape", "scfmSpread","mapBurns", "stateVars")
+
+ageMap<-raster(raster::extent(0,49,0,49),nrow=200, ncol=200, vals=as.integer(runif(200*200)*150))
+flammableMap <- ageMap * 0
+objects <- list(
+                scfmPars=list(pSpread=0.225,
+                  p0=0.115,
+                  naiveP0=0.15, 
+                  pIgnition=0.00004, #0.0000112,
+                  maxBurnCells=NA
+                  ),
+                ageMap = ageMap,
+                strataMap=randomPolygons(ageMap,numTypes=8),
+                landscapeAttr=list(cellSize=6.25),
+                flammableMap=flammableMap
+            )
+            
+paths <- list(
+  cachePath = file.path(outputDir, "cache"),
+  modulePath = file.path("scfmModules"),
+  inputPath = inputDir,
+  outputPath = outputDir
+)
+
+
+mySim <- simInit(times = times, params = parameters, modules = modules,
+                 objects = objects, paths = paths)
+
+if (exists("mySim")){
+  newPlot()
+  tmp <-spades(mySim,debug=TRUE)
+  
+  newPlot()
+  clearPlot()
+  Plot(apply(tmp$harvestStats,1,sum))
+  Plot(tmp$strataMap)
+  Plot(tmp$volMap)
+  Plot(tmp$harvestStateMap)
+  Plot(tmp$disturbanceMap)
+  Plot(tmp$ageMap)
+  
+  dev.useRSGD(TRUE)
+}
+
+```
+
